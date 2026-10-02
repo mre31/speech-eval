@@ -3,13 +3,21 @@
 Detects phonological elisions (ses düşmesi / yutulması), dialectal sound substitutions,
 and epenthetic insertions by aligning expected G2P phonemes against raw acoustic CTC predictions.
 
-NOTE ON CTC TOKENS VS PHONEMES:
-Standard Wav2Vec2 Turkish models are character-level CTC models, outputting orthographic
-letters (a, b, c, ç...) rather than true IPA phonetic symbols. While Turkish orthography
-is largely phonemic, allophonic variations ([c] vs [k], [ɟ] vs [ɡ], [j] vs [ː] for 'ğ')
-and dialectal contractions map through character tokens.
-The observed layer serves as an acoustic surface evidence transducer with confidence gating
-and multi-frame segment verification, rather than an unconstrained phonemic decoder.
+THREE PHONETIC SOUND RELATION CLASSES:
+1. ALLOPHONIC_EQUIVALENT_PAIRS:
+   True allophonic realizations in standard Istanbul Turkish (e.g. yumuşak g as vowel
+   lengthening or palatal glide, palatal vs velar k/g). No penalty applied (multiplier = 1.0).
+2. PHONETICALLY_CLOSE_PAIRS:
+   Acoustically adjacent sounds, natural vowel raising (İstanbul Türkçesi daralması e/i, a/ı),
+   or natural voicing assimilation. Evaluated with mild diagnostic or calibrated penalty.
+3. REAL_SUBSTITUTION (All other sound pairs):
+   Dialectal substitutions, non-native shifts (e.g. m ↔ n, a ↔ u, e ↔ ü, r ↔ ş, l ↔ r).
+   Evaluated with full substitution penalty when supported by high confidence (>0.85).
+
+UNCONSTRAINED DELETION VERIFICATION:
+To avoid circular dependency with forced alignment (which forces the transcript onto the audio),
+deletion verification evaluates independent unconstrained acoustic CTC posteriors (peak probability,
+posterior mass, frame margins, and competing sustained token activations).
 """
 
 from dataclasses import dataclass
@@ -38,41 +46,41 @@ class AlignmentDiagnostic:
     confidence: float = 1.0
 
 
-# Allophonic, phonetic similarity clusters and standard colloquial variations in Turkish
-PHONETIC_SIMILAR_PAIRS: Set[Tuple[str, str]] = {
-    # Palatal / Velar allophones
+# 1. Allophonic equivalents: Natural phonetic realizations of Turkish phonemes.
+# In standard Turkish, these represent orthography-to-phone identity (multiplier = 1.0, no penalty).
+ALLOPHONIC_EQUIVALENT_PAIRS: Set[Tuple[str, str]] = {
+    # Yumuşak G: In standard Turkish, ğ is not an obstruent consonant.
+    # It functions as vowel lengthening (ː) in back vowels, or weak palatal glide (y) in front vowels.
+    ('ğ', 'y'), ('y', 'ğ'),
+    ('ğ', 'ː'), ('ː', 'ğ'),
+    ('ğ', 'v'), ('v', 'ğ'),
+    # Palatal vs velar plosives (Turkish k and g allophones)
     ('k', 'c'), ('c', 'k'),
     ('g', 'ɟ'), ('ɟ', 'g'),
-    ('k', 'g'), ('g', 'k'),
-    # Voicing / Devoicing pairs
-    ('p', 'b'), ('b', 'p'),
-    ('t', 'd'), ('d', 't'),
-    ('ç', 'c'), ('c', 'ç'),
-    ('s', 'z'), ('z', 's'),
-    ('ş', 'j'), ('j', 'ş'),
-    ('f', 'v'), ('v', 'f'),
-    # Yumuşak G glide / vowel lengthening (standard Istanbul Turkish)
-    ('ğ', 'y'), ('y', 'ğ'),
-    ('ğ', 'v'), ('v', 'ğ'),
-    ('ğ', 'ː'), ('ː', 'ğ'),
-    ('y', 'i'), ('i', 'y'),
-    ('v', 'u'), ('u', 'v'),
-    # Vowel raising & colloquial Turkish variation (e.g. diye, başlıyor, geliyom)
+}
+
+# 2. Phonetically close pairs: Subtle acoustic shifts, vowel raising, or natural voicing variation.
+PHONETICALLY_CLOSE_PAIRS: Set[Tuple[str, str]] = {
+    # Standard Turkish vowel raising before y (daralma, e.g. diye, yiyen, başlıyor, geliyom)
     ('e', 'i'), ('i', 'e'),
     ('a', 'ı'), ('ı', 'a'),
-    ('a', 'u'), ('u', 'a'),
-    ('e', 'ü'), ('ü', 'e'),
-    # Vowel frontness / rounding closeness
+    # Close vowel frontness / rounding neighbors
     ('ı', 'i'), ('i', 'ı'),
     ('u', 'ü'), ('ü', 'u'),
     ('o', 'ö'), ('ö', 'o'),
     ('a', 'e'), ('e', 'a'),
-    # Liquid lenition / final coda devoicing (Turkish /r/ devoicing [ɾ̥] in fast speech)
-    ('r', 'ş'), ('ş', 'r'),
-    ('r', 'h'), ('h', 'r'),
-    ('l', 'r'), ('r', 'l'),
-    ('m', 'n'), ('n', 'm'),
+    # Natural voicing / devoicing pairs (voicing assimilation or partial devoicing in fast speech)
+    ('p', 'b'), ('b', 'p'),
+    ('t', 'd'), ('d', 't'),
+    ('k', 'g'), ('g', 'k'),
+    ('ç', 'c'), ('c', 'ç'),
+    ('s', 'z'), ('z', 's'),
+    ('ş', 'j'), ('j', 'ş'),
+    ('f', 'v'), ('v', 'f'),
 }
+
+# Unified set for backwards compatibility
+PHONETIC_SIMILAR_PAIRS: Set[Tuple[str, str]] = ALLOPHONIC_EQUIVALENT_PAIRS | PHONETICALLY_CLOSE_PAIRS
 
 
 class ObservedPhonemeAnalyzer:
@@ -133,16 +141,16 @@ class ObservedPhonemeAnalyzer:
     ) -> List[AlignmentDiagnostic]:
         """Aligns expected phonemes with observed CTC tokens using Needleman-Wunsch algorithm.
         
-        Applies confidence gating and multi-frame acoustic evidence verification:
-        - Confidence < 0.50: Insufficient evidence, no penalty applied (score_multiplier = 1.0)
-        - Confidence 0.50 - 0.70: Diagnostic observation only (score_multiplier = 1.0)
-        - Confidence 0.70 - 0.85: Mild penalty (score_multiplier = 0.88 - 0.95)
-        - Confidence >= 0.85: Calibrated penalty (score_multiplier = 0.75 - 0.90)
+        Applies confidence gating, 3-class phonetic categorization, and unconstrained deletion verification:
+        - Allophonic equivalents: multiplier = 1.0 (no penalty)
+        - Phonetically close pairs: mild penalty when confirmed
+        - Real substitutions: full substitution penalty when confidence > 0.85
+        - Deletion verification: independent unconstrained posterior mass without circular forced-alignment bias
         
         Args:
             expected_phonemes: Canonical phoneme sequence from G2P
             observed_tokens: Greedy decoded tokens from acoustic CTC logits
-            segments: Optional aligned segments with frame boundaries for multi-frame deletion check
+            segments: Optional aligned segments with frame boundaries
             logits: Optional raw CTC logits tensor [1, T, vocab_size]
             
         Returns:
@@ -151,39 +159,29 @@ class ObservedPhonemeAnalyzer:
         M = len(expected_phonemes)
         N = len(observed_tokens)
 
+        # Bug fix: If observed_tokens is completely empty (e.g. CTC decoder failure or all blanks),
+        # do NOT penalize the utterance by 25%. Mark layer as unavailable / uncertain with multiplier 1.0.
+        if not observed_tokens:
+            return [
+                AlignmentDiagnostic(
+                    status="uncertain",
+                    expected_char=p.grapheme.lower(),
+                    observed_char=None,
+                    score_multiplier=1.0,
+                    note="Gözlem katmanı verisi yetersiz / belirsiz",
+                    confidence=0.0
+                ) for p in expected_phonemes
+            ]
+
         # Pre-calculate probabilities if logits tensor is supplied
         probs_np = None
         if logits is not None:
             probs_np = torch.softmax(logits[0], dim=-1).detach().cpu().numpy()
 
-        # If no observed tokens at all, check segment evidence or mark unknown
-        if not observed_tokens:
-            diagnostics: List[AlignmentDiagnostic] = []
-            for p in expected_phonemes:
-                e_char = p.grapheme.lower()
-                if e_char == 'ğ':
-                    diagnostics.append(AlignmentDiagnostic(
-                        status="similar",
-                        expected_char=e_char,
-                        observed_char=None,
-                        score_multiplier=1.0,
-                        note="Standart uzatma / hafif kayma artikülasyonu",
-                        confidence=0.95
-                    ))
-                else:
-                    diagnostics.append(AlignmentDiagnostic(
-                        status="deletion",
-                        expected_char=e_char,
-                        observed_char=None,
-                        score_multiplier=0.75,
-                        note=f"Ses yutulmuş / telaffuz edilmedi ('{e_char}' düşmesi/elision)",
-                        confidence=0.85
-                    ))
-            return diagnostics
-
         # Scoring parameters for dynamic programming
         MATCH_SCORE = 3.0
-        SIMILAR_SCORE = 1.8
+        ALLOPHONE_SCORE = 2.8
+        CLOSE_SCORE = 1.8
         SUB_PENALTY = -2.0
         GAP_EXP = -2.5      # Expected phoneme omitted (deletion / elision)
         GAP_OBS = -1.5      # Spurious observed sound (insertion)
@@ -191,8 +189,10 @@ class ObservedPhonemeAnalyzer:
         def similarity_score(e_ch: str, o_ch: str) -> float:
             if e_ch == o_ch:
                 return MATCH_SCORE
-            if (e_ch, o_ch) in PHONETIC_SIMILAR_PAIRS:
-                return SIMILAR_SCORE
+            if (e_ch, o_ch) in ALLOPHONIC_EQUIVALENT_PAIRS:
+                return ALLOPHONE_SCORE
+            if (e_ch, o_ch) in PHONETICALLY_CLOSE_PAIRS:
+                return CLOSE_SCORE
             return SUB_PENALTY
 
         # DP score matrix: dp[i][j]
@@ -257,11 +257,10 @@ class ObservedPhonemeAnalyzer:
 
             if obs_idx is None:
                 # Expected phoneme did not produce an unconstrained greedy CTC token.
-                # Check for standard Turkish phonological rules:
+                # 1. Yumuşak G in standard Istanbul Turkish:
                 if exp_char == 'ğ':
-                    # Yumuşak g in standard Istanbul Turkish lengthens vowel or forms glide [j]
                     diagnostics.append(AlignmentDiagnostic(
-                        status="similar",
+                        status="match",
                         expected_char=exp_char,
                         observed_char=None,
                         score_multiplier=1.0,
@@ -270,33 +269,58 @@ class ObservedPhonemeAnalyzer:
                     ))
                     continue
 
-                # Check multi-frame acoustic evidence from segment and logits
+                # 2. Independent unconstrained acoustic verification:
+                # Evaluates raw CTC posteriors, peak mass, and competing non-blank frames
+                # without relying on circular forced-alignment confidence (seg_conf).
                 has_acoustic_evidence = False
                 del_confidence = 0.85
 
                 if segments is not None and exp_idx < len(segments):
                     seg = segments[exp_idx]
-                    seg_conf = getattr(seg, 'confidence', 0.5)
-                    seg_dur = getattr(seg, 'duration', 0.05)
 
                     if probs_np is not None and self.tokenizer is not None:
                         tok_id = self.tokenizer.convert_tokens_to_ids(exp_char)
                         if tok_id is not None and tok_id != getattr(self.tokenizer, 'unk_token_id', -1):
                             s_frame = max(0, getattr(seg, 'start_frame', 0) - 1)
                             e_frame = min(probs_np.shape[0], getattr(seg, 'end_frame', s_frame + 1) + 2)
+                            
                             if s_frame < e_frame:
                                 span_p = probs_np[s_frame:e_frame, tok_id]
-                                max_p = float(np.max(span_p)) if len(span_p) > 0 else 0.0
-                                
-                                # If the acoustic model shows distinct presence (> 0.22) or
-                                # forced alignment confidence is healthy, greedy CTC blank is not a deletion!
-                                if max_p >= 0.22 or seg_conf >= 0.50 or (seg_dur >= 0.05 and seg_conf >= 0.35):
+                                max_exp_p = float(np.max(span_p)) if len(span_p) > 0 else 0.0
+                                mass_exp_p = float(np.sum(span_p)) if len(span_p) > 0 else 0.0
+
+                                # Check frame-by-frame unconstrained posterior rankings
+                                top_non_blank_matches = 0
+                                competing_sustained_frames = 0
+
+                                for f in range(s_frame, e_frame):
+                                    f_probs = probs_np[f]
+                                    top1_id = int(np.argmax(f_probs))
+                                    if top1_id == tok_id:
+                                        top_non_blank_matches += 1
+                                    elif top1_id == 0:
+                                        # CTC blank is top1; check highest non-blank
+                                        f_non_blank = f_probs.copy()
+                                        f_non_blank[0] = -1.0
+                                        best_nb_id = int(np.argmax(f_non_blank))
+                                        if best_nb_id == tok_id and f_non_blank[best_nb_id] >= 0.18:
+                                            top_non_blank_matches += 1
+                                    else:
+                                        # A non-blank competitor dominates
+                                        if f_probs[top1_id] >= 0.70:
+                                            competing_sustained_frames += 1
+
+                                # Independent acoustic evidence criteria:
+                                # If unconstrained CTC had high peak probability, substantial mass,
+                                # or expected token was the leading non-blank prediction:
+                                if max_exp_p >= 0.28 or mass_exp_p >= 0.45 or top_non_blank_matches >= 1:
                                     has_acoustic_evidence = True
                                 else:
-                                    del_confidence = float(np.clip(1.0 - max(max_p, seg_conf), 0.0, 1.0))
+                                    del_confidence = float(np.clip(1.0 - max_exp_p, 0.50, 1.0))
+                                    if competing_sustained_frames >= 2:
+                                        del_confidence = max(del_confidence, 0.88)
                     else:
-                        if seg_conf >= 0.55 or (seg_dur >= 0.06 and seg_conf >= 0.35):
-                            has_acoustic_evidence = True
+                        del_confidence = 0.85
 
                 if has_acoustic_evidence:
                     diagnostics.append(AlignmentDiagnostic(
@@ -308,7 +332,7 @@ class ObservedPhonemeAnalyzer:
                         confidence=round(1.0 - del_confidence, 2)
                     ))
                 else:
-                    # Gated deletion penalty based on absence evidence strength
+                    # Gated deletion penalty based on independent absence evidence strength
                     if del_confidence < 0.50:
                         diagnostics.append(AlignmentDiagnostic(
                             status="uncertain",
@@ -350,6 +374,7 @@ class ObservedPhonemeAnalyzer:
                 obs_char = obs_tok.char.lower()
                 conf = obs_tok.confidence
 
+                # 1. Exact match
                 if exp_char == obs_char:
                     diagnostics.append(AlignmentDiagnostic(
                         status="match",
@@ -359,8 +384,18 @@ class ObservedPhonemeAnalyzer:
                         note="Standart telaffuz",
                         confidence=conf
                     ))
-                elif (exp_char, obs_char) in PHONETIC_SIMILAR_PAIRS:
-                    # Phonetic / allophonic cluster
+                # 2. Allophonic equivalent (e.g. k/c, g/ɟ, ğ/y, ğ/ː)
+                elif (exp_char, obs_char) in ALLOPHONIC_EQUIVALENT_PAIRS:
+                    diagnostics.append(AlignmentDiagnostic(
+                        status="match",
+                        expected_char=exp_char,
+                        observed_char=obs_char,
+                        score_multiplier=1.0,
+                        note="Standart allofonik varyant",
+                        confidence=conf
+                    ))
+                # 3. Phonetically close pair (e.g. e/i, a/ı, t/d, p/b, s/z)
+                elif (exp_char, obs_char) in PHONETICALLY_CLOSE_PAIRS:
                     if conf < 0.50:
                         diagnostics.append(AlignmentDiagnostic(
                             status="match",
@@ -397,8 +432,8 @@ class ObservedPhonemeAnalyzer:
                             note=f"Hafif ses değişimi ('{obs_char}')",
                             confidence=conf
                         ))
+                # 4. Real substitution (e.g. m ↔ n, a ↔ u, e ↔ ü, r ↔ ş, l ↔ r)
                 else:
-                    # Substitution candidate with confidence gating
                     if conf < 0.50:
                         diagnostics.append(AlignmentDiagnostic(
                             status="uncertain",
@@ -431,7 +466,7 @@ class ObservedPhonemeAnalyzer:
                             status="substitution",
                             expected_char=exp_char,
                             observed_char=obs_char,
-                            score_multiplier=0.78,
+                            score_multiplier=0.75,
                             note=f"'{obs_char}' olarak telaffuz edildi (beklenen: '{exp_char}')",
                             confidence=conf
                         ))
