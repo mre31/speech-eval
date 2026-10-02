@@ -29,9 +29,10 @@ class SpeechEvaluator:
         self.aligner = TurkishAligner(model_id=self.config.wav2vec2_model_id, device=self.config.device)
         self.extractor = PhoneticEmbeddingExtractor(target_layer=self.config.embedding_layer)
         self.tts_engine = TTSReferenceEngine(
-            speakers=self.config.tts_speakers,
+            engines=self.config.tts_engines,
             aligner=self.aligner,
-            extractor=self.extractor
+            extractor=self.extractor,
+            device=self.config.device
         )
         self.acoustics = AcousticFeatureExtractor(sr=self.config.sample_rate)
         self.prosody = ProsodyDurationAnalyzer(sr=self.config.sample_rate)

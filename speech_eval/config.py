@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import torch
 
 
@@ -33,14 +33,13 @@ class EvalConfig:
     min_alignment_confidence: float = 0.15   # Minimum CTC alignment probability
     outlier_trim_ratio: float = 0.10        # Trimmed mean ratio for robust aggregation
 
-    # TTS Reference configuration
-    # Multiple distinct neutral Istanbul Turkish voices + slight rate/pitch variations
-    tts_speakers: List[Tuple[str, str, str]] = field(
+    # High-grade TTS Ensemble: Azure Neural (Male & Female) + Meta MMS VITS + Piper DFKI VITS
+    tts_engines: List[Dict[str, Any]] = field(
         default_factory=lambda: [
-            ("tr-TR-AhmetNeural", "+0%", "+0Hz"),
-            ("tr-TR-EmelNeural", "+0%", "+0Hz"),
-            ("tr-TR-AhmetNeural", "-5%", "+2Hz"),
-            ("tr-TR-EmelNeural", "+5%", "-2Hz"),
+            {"type": "edge", "voice": "tr-TR-AhmetNeural", "label": "Azure Ahmet (Erkek)"},
+            {"type": "edge", "voice": "tr-TR-EmelNeural", "label": "Azure Emel (Kadın)"},
+            {"type": "mms", "model_id": "facebook/mms-tts-tur", "label": "Meta MMS-TTS (VITS GPU)"},
+            {"type": "piper", "model_path": str(Path(__file__).parent.parent / "data" / "piper_models" / "tr_TR-dfki-medium.onnx"), "label": "Piper DFKI (VITS ONNX)"},
         ]
     )
 
