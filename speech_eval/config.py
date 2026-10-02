@@ -23,10 +23,14 @@ class EvalConfig:
     embedding_layer: int = 12  # Layer with high phonetic articulation, low speaker identity
     
     # Scoring weights (sum to 1.0)
-    embedding_weight: float = 0.50
-    acoustic_weight: float = 0.25
+    embedding_weight: float = 0.60
+    acoustic_weight: float = 0.10
     duration_weight: float = 0.15
-    prosody_weight: float = 0.10
+    prosody_weight: float = 0.15
+
+    # Speaker invariance & Observed phoneme layer
+    subtract_speaker_embedding_mean: bool = True
+    enable_observed_phoneme_layer: bool = True
 
     # Filtering & Outlier thresholds
     min_phoneme_duration_sec: float = 0.025  # 25 ms

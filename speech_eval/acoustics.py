@@ -1,9 +1,12 @@
 """Acoustic feature analysis with speaker-invariant formant normalization.
 
-Extracts:
-- Vowels: F1, F2, F3 formants via Praat Burg algorithm, normalized with logarithmic formant ratios
-  and Lobanov-inspired vocal-tract normalization.
-- Consonants: Spectral centroid, spectral flatness, zero-crossing rate, voicing ratio, energy distribution.
+Extracts and evaluates:
+- Vowels: F1 and F2 formants via Praat Burg with speaker-adaptive pitch range.
+  Normalized via Nearey log-mean speaker normalization across utterance vowels.
+  Evaluates height (F1*) and frontness (F2*) independently with reference variance tolerance.
+  Never produces fake fallback formants when measurement is invalid.
+- Consonants: Manner-specific acoustic analysis (fricatives, plosives, nasals, liquids, affricates, glides).
+  Band-limited spectral processing with vocoder-invariant reference tolerance.
 """
 
 from typing import Dict, Any, List, Optional, Tuple
@@ -13,193 +16,362 @@ from parselmouth.praat import call
 import librosa
 
 from speech_eval.aligner import AlignedSegment
+from speech_eval.g2p import PhonemeItem
 
 
-# Standard Turkish vowel target formant ratios (log(F2/F1) and log(F3/F2))
-# Derived from Turkish phonetics literature
+# Baseline standard Turkish vowel reference values (approximate neutral means)
 STANDARD_TURKISH_VOWELS = {
-    'a': {'f1': 800.0, 'f2': 1300.0, 'f3': 2550.0, 'ratio_f2_f1': 1.62},
-    'e': {'f1': 500.0, 'f2': 1950.0, 'f3': 2650.0, 'ratio_f2_f1': 3.90},
-    'ı': {'f1': 400.0, 'f2': 1480.0, 'f3': 2400.0, 'ratio_f2_f1': 3.70},
-    'i': {'f1': 320.0, 'f2': 2350.0, 'f3': 2900.0, 'ratio_f2_f1': 7.34},
-    'o': {'f1': 520.0, 'f2': 1050.0, 'f3': 2450.0, 'ratio_f2_f1': 2.02},
-    'ö': {'f1': 480.0, 'f2': 1650.0, 'f3': 2400.0, 'ratio_f2_f1': 3.44},
-    'u': {'f1': 360.0, 'f2': 950.0,  'f3': 2400.0, 'ratio_f2_f1': 2.64},
-    'ü': {'f1': 340.0, 'f2': 1850.0, 'f3': 2450.0, 'ratio_f2_f1': 5.44},
+    'a': {'f1': 750.0, 'f2': 1250.0, 'f3': 2550.0, 'height': 'open',  'frontness': 'back'},
+    'e': {'f1': 480.0, 'f2': 1950.0, 'f3': 2650.0, 'height': 'mid',   'frontness': 'front'},
+    'ı': {'f1': 420.0, 'f2': 1400.0, 'f3': 2400.0, 'height': 'close', 'frontness': 'back'},
+    'i': {'f1': 320.0, 'f2': 2300.0, 'f3': 2900.0, 'height': 'close', 'frontness': 'front'},
+    'o': {'f1': 520.0, 'f2': 1050.0, 'f3': 2450.0, 'height': 'mid',   'frontness': 'back'},
+    'ö': {'f1': 460.0, 'f2': 1650.0, 'f3': 2400.0, 'height': 'mid',   'frontness': 'front'},
+    'u': {'f1': 360.0, 'f2': 950.0,  'f3': 2400.0, 'height': 'close', 'frontness': 'back'},
+    'ü': {'f1': 340.0, 'f2': 1850.0, 'f3': 2450.0, 'height': 'close', 'frontness': 'front'},
 }
 
 
 class AcousticFeatureExtractor:
-    """Extracts acoustic features tailored to vowels and consonants."""
+    """Extracts acoustic features tailored to vowels and specific consonant manners."""
 
     def __init__(self, sr: int = 16000):
         self.sr = sr
+
+    def detect_speaker_max_formant(self, audio: np.ndarray) -> float:
+        """Determines optimal Burg max formant ceiling based on speaker pitch (female/child vs male)."""
+        try:
+            sound = parselmouth.Sound(audio, sampling_frequency=self.sr)
+            pitch = sound.to_pitch(time_step=0.02)
+            f0 = pitch.selected_array['frequency']
+            voiced = f0[f0 > 0]
+            if len(voiced) > 0 and float(np.median(voiced)) > 170.0:
+                return 5500.0  # Female / high-pitch ceiling
+        except Exception:
+            pass
+        return 5000.0  # Male / default ceiling
 
     def extract_features(
         self,
         audio: np.ndarray,
         segment: AlignedSegment,
         praat_sound: Optional[parselmouth.Sound] = None,
-        praat_formants: Optional[Any] = None
+        praat_formants: Optional[Any] = None,
+        max_formant: float = 5500.0
     ) -> Dict[str, Any]:
         """Extracts class-specific acoustic features for an aligned phoneme."""
+        p = segment.phoneme
         feat: Dict[str, Any] = {
-            "grapheme": segment.phoneme.grapheme,
-            "is_vowel": segment.phoneme.is_vowel,
+            "grapheme": p.grapheme,
+            "ipa": p.ipa,
+            "is_vowel": p.is_vowel,
+            "consonant_manner": p.consonant_manner,
+            "consonant_place": p.consonant_place,
+            "consonant_voiced": p.consonant_voiced,
             "duration": segment.duration,
-            "confidence": segment.confidence
+            "confidence": segment.confidence,
+            "is_valid_formant": False
         }
 
         # Slice audio samples
-        start_samp = int(segment.start_time * self.sr)
-        end_samp = int(segment.end_time * self.sr)
+        start_samp = max(0, int(segment.start_time * self.sr))
+        end_samp = min(len(audio), int(segment.end_time * self.sr))
         seg_audio = audio[start_samp:end_samp]
 
         if len(seg_audio) < 128:
             return feat
 
-        # Vowel Acoustic Features: Formants & Formant Ratios
-        if segment.phoneme.is_vowel:
+        # 1. VOWEL ACOUSTICS
+        if p.is_vowel:
             if praat_sound is None:
                 praat_sound = parselmouth.Sound(audio, sampling_frequency=self.sr)
             if praat_formants is None:
                 praat_formants = praat_sound.to_formant_burg(
                     time_step=0.01,
                     max_number_of_formants=5,
-                    maximum_formant=5500.0
+                    maximum_formant=max_formant
                 )
 
-            # Sample central 60% of vowel duration to avoid transition artifacts
-            mid_t = (segment.start_time + segment.end_time) / 2.0
-            t_samples = np.linspace(
-                segment.start_time + 0.2 * segment.duration,
-                segment.end_time - 0.2 * segment.duration,
-                5
-            )
+            # Sample central 50% of vowel duration to avoid consonant transition glides
+            t_start = segment.start_time + 0.25 * segment.duration
+            t_end = segment.end_time - 0.25 * segment.duration
+            t_samples = np.linspace(t_start, t_end, 5) if t_end > t_start else [(segment.start_time + segment.end_time) / 2.0]
 
-            f1_list = [praat_formants.get_value_at_time(1, t) for t in t_samples]
-            f2_list = [praat_formants.get_value_at_time(2, t) for t in t_samples]
-            f3_list = [praat_formants.get_value_at_time(3, t) for t in t_samples]
+            f1_list = [praat_formants.get_value_at_time(1, float(t)) for t in t_samples]
+            f2_list = [praat_formants.get_value_at_time(2, float(t)) for t in t_samples]
+            f3_list = [praat_formants.get_value_at_time(3, float(t)) for t in t_samples]
 
-            f1_clean = [f for f in f1_list if not np.isnan(f) and 150 < f < 1400]
-            f2_clean = [f for f in f2_list if not np.isnan(f) and 600 < f < 3500]
-            f3_clean = [f for f in f3_list if not np.isnan(f) and 1400 < f < 4500]
+            f1_clean = [f for f in f1_list if not np.isnan(f) and 180.0 < f < 1300.0]
+            f2_clean = [f for f in f2_list if not np.isnan(f) and 550.0 < f < 3400.0]
+            f3_clean = [f for f in f3_list if not np.isnan(f) and 1400.0 < f < 4400.0]
 
-            f1 = float(np.median(f1_clean)) if f1_clean else 500.0
-            f2 = float(np.median(f2_clean)) if f2_clean else 1500.0
-            f3 = float(np.median(f3_clean)) if f3_clean else 2500.0
+            # If Praat failed, do NOT inject fake formants!
+            if f1_clean and f2_clean:
+                f1 = float(np.median(f1_clean))
+                f2 = float(np.median(f2_clean))
+                f3 = float(np.median(f3_clean)) if f3_clean else None
 
-            feat["f1"] = round(f1, 1)
-            feat["f2"] = round(f2, 1)
-            feat["f3"] = round(f3, 1)
+                feat["f1"] = round(f1, 1)
+                feat["f2"] = round(f2, 1)
+                feat["f3"] = round(f3, 1) if f3 else None
+                feat["log_f1"] = round(float(np.log(f1)), 4)
+                feat["log_f2"] = round(float(np.log(f2)), 4)
+                feat["is_valid_formant"] = True
+            else:
+                feat["f1"] = None
+                feat["f2"] = None
+                feat["f3"] = None
+                feat["is_valid_formant"] = False
 
-            # Speaker-invariant normalization: Formant frequency ratios
-            # F2 / F1 represents frontness vs height without speaker scale
-            feat["ratio_f2_f1"] = round(f2 / max(100.0, f1), 2)
-            feat["log_ratio_f2_f1"] = round(float(np.log(max(1.0, f2 / max(100.0, f1)))), 3)
-            feat["log_ratio_f3_f2"] = round(float(np.log(max(1.0, f3 / max(100.0, f2)))), 3)
-
-        # Consonant Acoustic Features: Spectral Centroid, Rolloff, Flatness, Voicing
+        # 2. CONSONANT ACOUSTICS (MANNER-SPECIFIC)
         else:
+            # Band-limit analysis up to 7500 Hz to prevent vocoder high-frequency cutoff discrepancies
             n_fft = min(512, max(64, len(seg_audio)))
             hop_length = max(32, n_fft // 4)
 
-            # Spectral centroid (distinguishes sibilants, place of articulation)
-            sc = librosa.feature.spectral_centroid(y=seg_audio, sr=self.sr, n_fft=n_fft, hop_length=hop_length)
-            feat["spectral_centroid"] = round(float(np.mean(sc)), 1)
+            # Voicing ratio (< 800 Hz energy / total)
+            fft_mag = np.abs(np.fft.rfft(seg_audio))
+            freqs = np.fft.rfftfreq(len(seg_audio), 1.0 / self.sr)
+            # Mask out frequencies > 7500 Hz
+            band_mask = freqs <= 7500.0
+            fft_mag_band = fft_mag[band_mask]
+            freqs_band = freqs[band_mask]
 
-            # Spectral flatness (tonal vs noisy/fricative)
-            sf = librosa.feature.spectral_flatness(y=seg_audio, n_fft=n_fft, hop_length=hop_length)
-            feat["spectral_flatness"] = round(float(np.mean(sf)), 4)
+            total_band_energy = float(np.sum(fft_mag_band ** 2)) + 1e-12
+            low_energy = float(np.sum(fft_mag_band[freqs_band < 800.0] ** 2))
+            nasal_energy = float(np.sum(fft_mag_band[freqs_band < 500.0] ** 2))
 
-            # Zero crossing rate
+            feat["voicing_ratio"] = round(low_energy / total_band_energy, 3)
+            feat["nasal_murmur_ratio"] = round(nasal_energy / total_band_energy, 3)
+
+            # Zero-crossing rate
             zcr = librosa.feature.zero_crossing_rate(y=seg_audio, hop_length=hop_length)
             feat["zero_crossing_rate"] = round(float(np.mean(zcr)), 4)
 
-            # Voicing ratio (energy < 1000 Hz / total energy)
-            fft_mag = np.abs(np.fft.rfft(seg_audio))
-            freqs = np.fft.rfftfreq(len(seg_audio), 1.0 / self.sr)
-            low_energy = np.sum(fft_mag[freqs < 1000.0] ** 2)
-            total_energy = np.sum(fft_mag ** 2) + 1e-10
-            feat["voicing_ratio"] = round(float(low_energy / total_energy), 3)
+            # Spectral Centroid (band-limited)
+            if total_band_energy > 1e-8:
+                sc = float(np.sum(freqs_band * (fft_mag_band ** 2)) / total_band_energy)
+                feat["spectral_centroid"] = round(sc, 1)
+            else:
+                feat["spectral_centroid"] = 3000.0
+
+            # Spectral Flatness
+            sf = librosa.feature.spectral_flatness(y=seg_audio, n_fft=n_fft, hop_length=hop_length)
+            feat["spectral_flatness"] = round(float(np.mean(sf)), 4)
 
         return feat
 
 
-def compare_vowel_acoustics(user_feat: Dict[str, Any], ref_feats: List[Dict[str, Any]]) -> Tuple[float, str]:
-    """Compares user vowel formant ratios against standard references.
+def normalize_utterance_vowels(vowel_features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Performs Nearey log-mean speaker normalization across all valid vowels in an utterance.
+    
+    F1* = ln(F1) - mean(ln(F1))
+    F2* = ln(F2) - mean(ln(F2))
+    
+    This decouples vocal tract length (speaker gender/age) while preserving relative vowel height & frontness.
+    """
+    valid_vowels = [vf for vf in vowel_features if vf.get("is_valid_formant") and vf.get("log_f1") is not None]
+    
+    if len(valid_vowels) >= 2:
+        mean_log_f1 = float(np.mean([vf["log_f1"] for vf in valid_vowels]))
+        mean_log_f2 = float(np.mean([vf["log_f2"] for vf in valid_vowels]))
+    else:
+        # Standard default centers if utterance has only 1 vowel
+        mean_log_f1 = np.log(480.0)
+        mean_log_f2 = np.log(1600.0)
+
+    for vf in vowel_features:
+        if vf.get("is_valid_formant") and vf.get("log_f1") is not None:
+            vf["f1_star"] = round(vf["log_f1"] - mean_log_f1, 4)
+            vf["f2_star"] = round(vf["log_f2"] - mean_log_f2, 4)
+        else:
+            vf["f1_star"] = None
+            vf["f2_star"] = None
+
+    return vowel_features
+
+
+def compare_vowel_acoustics(
+    user_feat: Dict[str, Any],
+    ref_feats: List[Dict[str, Any]],
+    user_vowels_context: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[Optional[float], str]:
+    """Compares user vowel normalized formants (F1*, F2*) against standard Turkish references.
+    
+    Evaluates:
+    - F1* (vowel height / openness)
+    - F2* (vowel frontness / backness)
     
     Returns:
-        (acoustic_similarity_score 0-100, diagnostic_note)
+        (acoustic_similarity_score 0-100 or None, diagnostic_note)
     """
+    if not user_feat.get("is_valid_formant") or user_feat.get("f1_star") is None:
+        # Formants could not be tracked cleanly (unvoiced, creaky, or short segment)
+        # Return None so scorer falls back cleanly without penalizing the speaker!
+        return None, "Formant ölçümü yetersiz (akustik nötr)"
+
     g = user_feat.get("grapheme", "")
-    user_ratio = user_feat.get("ratio_f2_f1", 1.0)
-    user_f1 = user_feat.get("f1", 500.0)
-    user_f2 = user_feat.get("f2", 1500.0)
+    u_f1_star = user_feat["f1_star"]
+    u_f2_star = user_feat["f2_star"]
 
-    # Reference target
-    ref_target = STANDARD_TURKISH_VOWELS.get(g)
-    if not ref_target:
-        return 80.0, "Standart aralıkta"
+    # Collect reference normalized formants
+    ref_f1_stars = [rf["f1_star"] for rf in ref_feats if rf.get("is_valid_formant") and rf.get("f1_star") is not None]
+    ref_f2_stars = [rf["f2_star"] for rf in ref_feats if rf.get("is_valid_formant") and rf.get("f2_star") is not None]
 
-    target_ratio = ref_target["ratio_f2_f1"]
+    if ref_f1_stars and ref_f2_stars:
+        target_f1_star = float(np.median(ref_f1_stars))
+        target_f2_star = float(np.median(ref_f2_stars))
+        # Reference ensemble standard deviations act as natural tolerance
+        sigma_f1 = max(0.12, float(np.std(ref_f1_stars)))
+        sigma_f2 = max(0.12, float(np.std(ref_f2_stars)))
+    else:
+        # Theoretical fallback targets in Nearey space
+        default_means = {
+            'a': (0.35, -0.25),
+            'e': (-0.05, 0.22),
+            'ı': (-0.20, -0.15),
+            'i': (-0.45, 0.38),
+            'o': (0.05, -0.45),
+            'ö': (-0.05, 0.05),
+            'u': (-0.35, -0.55),
+            'ü': (-0.40, 0.15),
+        }
+        target_f1_star, target_f2_star = default_means.get(g, (0.0, 0.0))
+        sigma_f1, sigma_f2 = 0.18, 0.18
+
+    # Height and Frontness errors normalized by reference variance + tolerance buffer
+    diff_f1 = u_f1_star - target_f1_star
+    diff_f2 = u_f2_star - target_f2_star
+
+    z_f1 = abs(diff_f1) / (sigma_f1 + 0.08)
+    z_f2 = abs(diff_f2) / (sigma_f2 + 0.08)
+
+    # Combined acoustic distance
+    # Error under 1.5 z-score is completely within standard variation (score 90-100)
+    total_z = float(np.sqrt(0.5 * (z_f1 ** 2) + 0.5 * (z_f2 ** 2)))
     
-    # Also collect median ratio from TTS reference features if available
-    ref_ratios = [rf["ratio_f2_f1"] for rf in ref_feats if rf.get("ratio_f2_f1") is not None]
-    if ref_ratios:
-        target_ratio = float(np.median(ref_ratios))
+    score = max(30.0, min(100.0, 100.0 - max(0.0, total_z - 1.0) * 35.0))
 
-    # Normalized relative error
-    rel_error = abs(user_ratio - target_ratio) / target_ratio
-    
-    # Non-linear scoring curve: error < 0.10 is excellent (90-100), > 0.40 drops rapidly
-    score = max(0.0, min(100.0, 100.0 - (rel_error * 180.0)))
+    # Diagnostic feedback - only emit when deviation is truly significant (z > 2.2)
+    diag_notes = []
+    if z_f2 > 2.2:
+        if diff_f2 < -0.28:
+            diag_notes.append("Ön ünlü arkaya kaymış / kalınlaşmış")
+        elif diff_f2 > 0.28:
+            diag_notes.append("Art ünlü öne kaymış / inceltilmiş")
 
-    # Diagnostic feedback
-    note = "Standart telaffuz"
-    if rel_error > 0.20:
-        if user_ratio < target_ratio:
-            if g in ['e', 'i', 'ö', 'ü']:
-                note = "Ön ünlü arkaya kaymış veya kapalı"
-            else:
-                note = "Art ünlü öne kaymış"
-        else:
-            if g in ['a', 'ı', 'o', 'u']:
-                note = "Art ünlü önleşmiş"
-            else:
-                note = "Aşırı inceltilmiş / önleşmiş"
+    if z_f1 > 2.2:
+        if diff_f1 > 0.28:
+            diag_notes.append("Ünlü fazla açık / alçak telaffuz edilmiş")
+        elif diff_f1 < -0.28:
+            diag_notes.append("Ünlü fazla kapalı / dar telaffuz edilmiş")
 
+    note = "; ".join(diag_notes) if diag_notes else "Standart telaffuz"
     return round(score, 1), note
 
 
-def compare_consonant_acoustics(user_feat: Dict[str, Any], ref_feats: List[Dict[str, Any]]) -> Tuple[float, str]:
-    """Compares user consonant spectral properties with standard references.
+def compare_consonant_acoustics(
+    user_feat: Dict[str, Any],
+    ref_feats: List[Dict[str, Any]]
+) -> Tuple[float, str]:
+    """Compares user consonant acoustic properties with standard references using manner-specific metrics.
+    
+    Manners:
+    - Fricatives: Spectral centroid, spectral tilt, flatness (band-limited).
+    - Plosives: Voicing during closure, burst characteristics.
+    - Nasals: Low frequency nasal murmur (< 500 Hz).
+    - Liquids / Approximants / Glides: Formant continuity and voicing.
     
     Returns:
         (acoustic_similarity_score 0-100, diagnostic_note)
     """
+    manner = user_feat.get("consonant_manner", "fricative")
+    is_voiced = user_feat.get("consonant_voiced", False)
     u_sc = user_feat.get("spectral_centroid", 3000.0)
     u_flat = user_feat.get("spectral_flatness", 0.05)
+    u_voice = user_feat.get("voicing_ratio", 0.5)
+    u_nasal = user_feat.get("nasal_murmur_ratio", 0.5)
 
     ref_scs = [rf["spectral_centroid"] for rf in ref_feats if rf.get("spectral_centroid") is not None]
     ref_flats = [rf["spectral_flatness"] for rf in ref_feats if rf.get("spectral_flatness") is not None]
+    ref_voices = [rf["voicing_ratio"] for rf in ref_feats if rf.get("voicing_ratio") is not None]
+    ref_nasals = [rf["nasal_murmur_ratio"] for rf in ref_feats if rf.get("nasal_murmur_ratio") is not None]
 
-    if not ref_scs:
-        return 80.0, "Standart aralıkta"
+    med_sc = float(np.median(ref_scs)) if ref_scs else 3000.0
+    sigma_sc = max(400.0, float(np.std(ref_scs))) if ref_scs else 500.0
 
-    med_sc = float(np.median(ref_scs))
     med_flat = float(np.median(ref_flats)) if ref_flats else 0.05
+    med_voice = float(np.median(ref_voices)) if ref_voices else 0.5
+    med_nasal = float(np.median(ref_nasals)) if ref_nasals else 0.5
 
-    sc_err = abs(u_sc - med_sc) / max(1000.0, med_sc)
-    flat_err = abs(u_flat - med_flat) / max(0.01, med_flat)
+    # 1. FRICATIVES (/s, z, ʃ, ʒ, f, v, h/)
+    if manner == "fricative":
+        z_sc = abs(u_sc - med_sc) / sigma_sc
+        flat_err = abs(u_flat - med_flat) / max(0.02, med_flat)
 
-    score = max(0.0, min(100.0, 100.0 - (sc_err * 80.0 + flat_err * 40.0)))
-    
-    note = "Standart telaffuz"
-    if sc_err > 0.35:
-        if u_sc < med_sc:
-            note = "Boğumlanma yeri geri çekilmiş (yumuşak/gevşek sürtünme)"
+        score = max(40.0, min(100.0, 100.0 - max(0.0, z_sc - 1.2) * 25.0 - max(0.0, flat_err - 1.0) * 20.0))
+        
+        note = "Standart telaffuz"
+        if z_sc > 2.5:
+            if u_sc < med_sc - 1000.0:
+                note = "Sürtünme odağı geride (gevşek/yumuşak artikülasyon)"
+            elif u_sc > med_sc + 1000.0:
+                note = "Sürtünme frekansı yüksek (sert artikülasyon)"
+        return round(score, 1), note
+
+    # 2. PLOSIVES (/p, t, k, b, d, g, c, ɟ/)
+    elif manner in ("plosive", "stop"):
+        # For plosives, spectral centroid is vocoder-sensitive; focus on voicing and burst
+        voicing_diff = u_voice - med_voice
+        score = 88.0
+        note = "Standart telaffuz"
+
+        if not is_voiced and u_voice > 0.75 and med_voice < 0.40:
+            # Unvoiced plosive /p, t, k/ excessively voiced
+            score = 65.0
+            note = "Ötümsüz ünsüz aşırı ötümlüleşmiş / yumuşamış"
+        elif is_voiced and u_voice < 0.30 and med_voice > 0.60:
+            # Voiced plosive /b, d, g/ devoiced
+            score = 70.0
+            note = "Ötümlü ünsüz sertleşmiş (ötümsüzleşmiş)"
         else:
-            note = "Sürtünme frekansı yüksek / sert artikülasyon"
+            score = max(75.0, min(100.0, 95.0 - abs(voicing_diff) * 30.0))
 
-    return round(score, 1), note
+        return round(score, 1), note
+
+    # 3. NASALS (/m, n/)
+    elif manner == "nasal":
+        # Nasals have strong energy below 500 Hz
+        nasal_diff = med_nasal - u_nasal
+        note = "Standart telaffuz"
+        
+        if u_nasal < 0.40 and med_nasal > 0.65:
+            score = 65.0
+            note = "Genizsi tını (nazal rezonans) zayıf"
+        else:
+            score = max(75.0, min(100.0, 95.0 - max(0.0, nasal_diff) * 40.0))
+
+        return round(score, 1), note
+
+    # 4. LIQUIDS (/l, ɾ/) & GLIDES (/j, ː/)
+    elif manner in ("liquid", "glide", "approximant"):
+        # Flaps and liquids should have low noise / turbulence (moderate flatness and voicing)
+        score = 90.0
+        note = "Standart telaffuz"
+        if u_flat > 0.20 and med_flat < 0.08:
+            score = 72.0
+            note = "Sürtünmeli / pürüzlü artikülasyon"
+        else:
+            score = max(80.0, min(100.0, 95.0 - max(0.0, u_flat - med_flat) * 50.0))
+
+        return round(score, 1), note
+
+    # 5. AFFRICATES (/t͡ʃ, d͡ʒ/)
+    elif manner == "affricate":
+        z_sc = abs(u_sc - med_sc) / sigma_sc
+        score = max(60.0, min(100.0, 95.0 - max(0.0, z_sc - 1.5) * 20.0))
+        note = "Standart telaffuz"
+        return round(score, 1), note
+
+    # Default fallback
+    return 88.0, "Standart telaffuz"

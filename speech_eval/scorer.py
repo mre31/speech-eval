@@ -63,13 +63,14 @@ class SpeechScorer:
         duration: float,
         confidence: float,
         embedding_score: float,
-        acoustic_score: float,
+        acoustic_score: Optional[float],
         duration_score: float,
         prosody_score: float,
-        diagnostic_note: str = ""
+        diagnostic_note: str = "",
+        score_multiplier: float = 1.0
     ) -> PhonemeScoreDetail:
         """Computes weighted single phoneme score and assesses validity."""
-        # Outlier & quality checks
+        # Quality & outlier checks
         is_valid = True
         notes = []
 
@@ -81,15 +82,29 @@ class SpeechScorer:
             is_valid = False
             notes.append("Çok kısa ses segmenti")
 
-        final_note = "; ".join(notes) if notes else (diagnostic_note or "Standart telaffuz")
+        # If acoustic score is None (e.g. formants could not be measured by Praat),
+        # redistribute its weight to phonetic embedding score to avoid penalizing the user
+        if acoustic_score is None:
+            eff_acoustic = embedding_score
+            acoustic_display = round(embedding_score, 1)
+        else:
+            eff_acoustic = acoustic_score
+            acoustic_display = round(acoustic_score, 1)
 
-        # Configurable weighted combination
-        total = (
+        # Weighted score combination
+        raw_total = (
             self.config.embedding_weight * embedding_score +
-            self.config.acoustic_weight * acoustic_score +
+            self.config.acoustic_weight * eff_acoustic +
             self.config.duration_weight * duration_score +
             self.config.prosody_weight * prosody_score
         )
+
+        # Apply observed pronunciation multiplier (e.g. dropped/elided sounds or substitutions)
+        total = raw_total * score_multiplier
+        if score_multiplier < 0.95:
+            embedding_score = embedding_score * score_multiplier
+
+        final_note = diagnostic_note if diagnostic_note else ("; ".join(notes) if notes else "Standart telaffuz")
 
         return PhonemeScoreDetail(
             grapheme=phoneme.grapheme,
@@ -103,10 +118,10 @@ class SpeechScorer:
             alignment_confidence=round(confidence, 3),
             is_valid=is_valid,
             embedding_score=round(embedding_score, 1),
-            acoustic_score=round(acoustic_score, 1),
+            acoustic_score=acoustic_display,
             duration_score=round(duration_score, 1),
             prosody_score=round(prosody_score, 1),
-            total_score=round(np.clip(total, 0.0, 100.0), 1),
+            total_score=round(float(np.clip(total, 0.0, 100.0)), 1),
             diagnostic_note=final_note
         )
 

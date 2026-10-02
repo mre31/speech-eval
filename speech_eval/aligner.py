@@ -1,7 +1,7 @@
 """Forced alignment module for Turkish speech using Wav2Vec2 CTC."""
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 import numpy as np
 import torch
 import torchaudio
@@ -39,8 +39,9 @@ class TurkishAligner:
         audio: np.ndarray,
         phonemes: List[PhonemeItem],
         sr: int = 16000,
-        return_hidden_states: bool = True
-    ) -> Tuple[List[AlignedSegment], Optional[torch.Tensor]]:
+        return_hidden_states: bool = True,
+        return_logits: bool = False
+    ) -> Any:
         """Aligns phonemes to audio and returns aligned segments with exact timestamps.
         
         Args:
@@ -48,12 +49,13 @@ class TurkishAligner:
             phonemes: List of PhonemeItem from TurkishG2P
             sr: Sampling rate (must be 16000)
             return_hidden_states: Whether to return layer hidden states for embedding extraction
+            return_logits: Whether to return CTC logits tensor
             
         Returns:
-            Tuple of (aligned_segments, hidden_states)
+            Tuple of (aligned_segments, hidden_states) or (aligned_segments, hidden_states, logits)
         """
         if len(audio) == 0 or not phonemes:
-            return [], None
+            return ([], None, None) if return_logits else ([], None)
 
         inputs = self.processor(audio, sampling_rate=sr, return_tensors="pt").to(self.device)
 
@@ -110,7 +112,7 @@ class TurkishAligner:
             spans = torchaudio.functional.merge_tokens(aligned_tokens[0], scores[0], blank=0)
         except Exception:
             # In case forced alignment fails (e.g. audio too short or extreme mismatch)
-            return [], hidden_states
+            return ([], hidden_states, logits) if return_logits else ([], hidden_states)
 
         # Filter out delimiter tokens and match with phonemes
         aligned_segments: List[AlignedSegment] = []
@@ -127,7 +129,7 @@ class TurkishAligner:
                 phoneme_idx += 1
 
         if not char_spans:
-            return [], hidden_states
+            return ([], hidden_states, logits) if return_logits else ([], hidden_states)
 
         # Expand spans to bridge blank boundaries naturally
         for i, (span, phoneme_item) in enumerate(char_spans):
@@ -164,4 +166,4 @@ class TurkishAligner:
                 end_frame=effective_end
             ))
 
-        return aligned_segments, hidden_states
+        return (aligned_segments, hidden_states, logits) if return_logits else (aligned_segments, hidden_states)

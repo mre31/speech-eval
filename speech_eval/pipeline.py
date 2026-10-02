@@ -1,7 +1,7 @@
 """End-to-end evaluation pipeline for Turkish pronunciation and accent closeness."""
 
 from pathlib import Path
-from typing import Union, Optional, Dict, Any
+from typing import Union, Optional, Dict, Any, List
 import numpy as np
 
 from speech_eval.config import EvalConfig, default_config
@@ -11,8 +11,14 @@ from speech_eval.g2p import TurkishG2P
 from speech_eval.aligner import TurkishAligner
 from speech_eval.embeddings import PhoneticEmbeddingExtractor, compute_cosine_similarity, similarity_to_score
 from speech_eval.tts_reference import TTSReferenceEngine
-from speech_eval.acoustics import AcousticFeatureExtractor, compare_vowel_acoustics, compare_consonant_acoustics
+from speech_eval.acoustics import (
+    AcousticFeatureExtractor,
+    normalize_utterance_vowels,
+    compare_vowel_acoustics,
+    compare_consonant_acoustics
+)
 from speech_eval.prosody import ProsodyDurationAnalyzer
+from speech_eval.observed import ObservedPhonemeAnalyzer
 from speech_eval.distribution import PhonemeDistributionManager
 from speech_eval.scorer import SpeechScorer, EvaluationResult, PhonemeScoreDetail
 
@@ -23,7 +29,7 @@ class SpeechEvaluator:
     def __init__(self, config: Optional[EvalConfig] = None):
         self.config = config or default_config
 
-        # Pipeline components (lazy initialized where appropriate)
+        # Pipeline components
         self.stt = TurkishSTT(model_size=self.config.whisper_model_size, device=self.config.device)
         self.g2p = TurkishG2P()
         self.aligner = TurkishAligner(model_id=self.config.wav2vec2_model_id, device=self.config.device)
@@ -36,6 +42,7 @@ class SpeechEvaluator:
         )
         self.acoustics = AcousticFeatureExtractor(sr=self.config.sample_rate)
         self.prosody = ProsodyDurationAnalyzer(sr=self.config.sample_rate)
+        self.observed_analyzer = ObservedPhonemeAnalyzer(tokenizer=self.aligner.processor.tokenizer)
         self.scorer = SpeechScorer(config=self.config)
 
         # Statistical offline reference manager (only active if use_offline_database=True)
@@ -73,47 +80,74 @@ class SpeechEvaluator:
         if not phonemes:
             raise ValueError("Fonem dizisi oluşturulamadı.")
 
-        # 4. User Forced Alignment
-        user_segments, user_hidden = self.aligner.align(
+        # 4. User Forced Alignment & Unconstrained CTC Logits
+        user_segments, user_hidden, user_logits = self.aligner.align(
             audio=audio,
             phonemes=phonemes,
             sr=self.config.sample_rate,
-            return_hidden_states=True
+            return_hidden_states=True,
+            return_logits=True
         )
 
         if not user_segments or user_hidden is None:
             raise ValueError("Ses ile fonem dizisi hizalanamadı.")
 
-        # Extract user embeddings
-        user_embeddings = self.extractor.extract_all(user_hidden, user_segments)
+        # 5. Observed Pronunciation Analysis (detects elisions, substitutions, dialectal sound drops)
+        observed_diagnostics = []
+        if self.config.enable_observed_phoneme_layer and user_logits is not None:
+            observed_tokens = self.observed_analyzer.decode_logits(user_logits)
+            observed_diagnostics = self.observed_analyzer.align_sequences(phonemes, observed_tokens)
 
-        # 5. Standard References (Multi-TTS and/or Offline Distributions)
+        # 6. Extract user embeddings with speaker-mean subtraction
+        user_embeddings = self.extractor.extract_all(
+            user_hidden,
+            user_segments,
+            subtract_speaker_mean=self.config.subtract_speaker_embedding_mean
+        )
+
+        # 7. Standard References (Multi-Engine Neural TTS Ensemble)
         ref_data = self.tts_engine.generate_references(norm_text, phonemes)
-
-        # Collect reference segments & embeddings
         ref_segments_list = [r["segments"] for r in ref_data]
 
-        # 6. Prosody & Duration Analysis
+        # 8. Prosody & Duration Analysis
         duration_details = self.prosody.analyze_durations(user_segments, ref_segments_list)
-        intonation_score, pitch_contour = self.prosody.analyze_intonation(audio, user_segments)
+        intonation_score, pitch_contour = self.prosody.analyze_intonation(audio, user_segments, ref_data=ref_data)
 
-        # Extract acoustic features for user segments
+        # 9. Acoustic Feature Extraction & Speaker-Level Vowel Normalization
+        user_max_formant = self.acoustics.detect_speaker_max_formant(audio)
         user_acoustic_feats = [
-            self.acoustics.extract_features(audio, seg) for seg in user_segments
+            self.acoustics.extract_features(audio, seg, max_formant=user_max_formant)
+            for seg in user_segments
         ]
+        
+        # Nearey log-mean speaker normalization across user's valid vowels in this utterance
+        user_vowels = [f for f in user_acoustic_feats if f["is_vowel"]]
+        normalize_utterance_vowels(user_vowels)
 
-        # Extract acoustic features for reference segments
-        ref_acoustic_feats_by_idx = []
+        # Extract & normalize reference acoustic features per engine
+        ref_engine_feats: List[List[Dict[str, Any]]] = []
+        for r in ref_data:
+            r_audio = r["audio"]
+            r_segs = r["segments"]
+            r_max_formant = self.acoustics.detect_speaker_max_formant(r_audio)
+            r_feats = [
+                self.acoustics.extract_features(r_audio, s, max_formant=r_max_formant)
+                for s in r_segs
+            ]
+            r_vowels = [f for f in r_feats if f["is_vowel"]]
+            normalize_utterance_vowels(r_vowels)
+            ref_engine_feats.append(r_feats)
+
+        # Regroup reference features by phoneme index
+        ref_acoustic_feats_by_idx: List[List[Dict[str, Any]]] = []
         for i in range(len(user_segments)):
             idx_feats = []
-            for r in ref_data:
-                if i < len(r["segments"]):
-                    ref_audio = r["audio"]
-                    ref_seg = r["segments"][i]
-                    idx_feats.append(self.acoustics.extract_features(ref_audio, ref_seg))
+            for r_feats in ref_engine_feats:
+                if i < len(r_feats):
+                    idx_feats.append(r_feats[i])
             ref_acoustic_feats_by_idx.append(idx_feats)
 
-        # 7. Phoneme-level scoring
+        # 10. Phoneme-level scoring
         phoneme_score_details: List[PhonemeScoreDetail] = []
 
         for i, (u_seg, u_emb, u_ac, dur_info) in enumerate(zip(
@@ -145,7 +179,6 @@ class SpeechEvaluator:
                 if dist is not None:
                     maha_dist = self.dist_mgr.compute_mahalanobis_distance(u_emb, dist)
                     maha_score = self.dist_mgr.mahalanobis_to_score(maha_dist)
-                    # Blend cosine similarity with Mahalanobis score
                     emb_score = 0.5 * emb_score + 0.5 * maha_score
 
             # Acoustic feature score & diagnostic note
@@ -154,6 +187,17 @@ class SpeechEvaluator:
                 ac_score, diag_note = compare_vowel_acoustics(u_ac, r_feats)
             else:
                 ac_score, diag_note = compare_consonant_acoustics(u_ac, r_feats)
+
+            # Observed pronunciation check (overrides or supplements diagnostic note)
+            score_multiplier = 1.0
+            if i < len(observed_diagnostics):
+                obs_diag = observed_diagnostics[i]
+                if obs_diag.status in ("deletion", "substitution"):
+                    score_multiplier = obs_diag.score_multiplier
+                    diag_note = obs_diag.note
+                elif obs_diag.status == "similar" and diag_note == "Standart telaffuz":
+                    diag_note = obs_diag.note
+                    score_multiplier = obs_diag.score_multiplier
 
             # Duration score
             dur_score = dur_info["duration_score"]
@@ -167,14 +211,15 @@ class SpeechEvaluator:
                 acoustic_score=ac_score,
                 duration_score=dur_score,
                 prosody_score=intonation_score,
-                diagnostic_note=diag_note
+                diagnostic_note=diag_note,
+                score_multiplier=score_multiplier
             )
             p_score_detail.start_time = u_seg.start_time
             p_score_detail.end_time = u_seg.end_time
 
             phoneme_score_details.append(p_score_detail)
 
-        # 8. Robust Aggregation
+        # 11. Robust Aggregation
         result = self.scorer.aggregate_results(
             phoneme_scores=phoneme_score_details,
             intonation_score=intonation_score,

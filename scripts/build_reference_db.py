@@ -43,9 +43,10 @@ def build_database(output_path: Path):
     aligner = TurkishAligner(model_id=default_config.wav2vec2_model_id, device=default_config.device)
     extractor = PhoneticEmbeddingExtractor(target_layer=default_config.embedding_layer)
     tts_engine = TTSReferenceEngine(
-        speakers=default_config.tts_speakers,
+        engines=default_config.tts_engines,
         aligner=aligner,
-        extractor=extractor
+        extractor=extractor,
+        device=default_config.device
     )
     dist_mgr = PhonemeDistributionManager()
 
