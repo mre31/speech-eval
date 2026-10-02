@@ -76,7 +76,8 @@ function initRecording() {
         };
 
         mediaRecorder.onstop = () => {
-          audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+          const mimeType = mediaRecorder.mimeType || 'audio/webm';
+          audioBlob = new Blob(audioChunks, { type: mimeType });
           const audioUrl = URL.createObjectURL(audioBlob);
           player.src = audioUrl;
           previewBox.style.display = 'block';
@@ -197,7 +198,9 @@ function initEvaluateButton() {
     resultsSection.style.display = 'none';
 
     const formData = new FormData();
-    formData.append('file', audioBlob, 'speech.wav');
+    const isFile = (audioBlob instanceof File);
+    const filename = isFile ? audioBlob.name : ((mediaRecorder && mediaRecorder.mimeType && mediaRecorder.mimeType.includes('webm')) ? 'speech.webm' : 'speech.wav');
+    formData.append('file', audioBlob, filename);
     const targetText = document.getElementById('targetText').value.trim();
     if (targetText) {
       formData.append('target_text', targetText);
