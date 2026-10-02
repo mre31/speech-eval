@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Türkçe Şive ve Telaffuz Ölçer | Standart Türkçe Yakınlık Analizi</title>
+  <meta name="description" content="Kullanıcının konuşmasını analiz ederek standart nötr Türkçe telaffuza yakınlığını 0-100 arasında ölçen fonetik değerlendirme sistemi.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <div class="badge-tag">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        Akustik & Fonetik Değerlendirme
+      </div>
+      <h1>Türkçe Şive ve Telaffuz Ölçer</h1>
+      <p class="subtitle">Konuşmanızın standart İstanbul Türkçesi telaffuzuna ve fonetik kurallarına ne kadar yakın olduğunu yapay zeka ve akustik analizle ölçün.</p>
+    </header>
+
+    <!-- Main Input Card -->
+    <div class="glass-panel">
+      <!-- Sentence Presets -->
+      <div class="presets-section">
+        <span class="section-label">Örnek Alıştırma Cümleleri (Hızlı Seçim)</span>
+        <div id="presetChips" class="preset-chips">
+          <!-- Preset chips dynamically rendered -->
+        </div>
+      </div>
+
+      <!-- Target Text Input -->
+      <div class="input-group">
+        <div class="input-label">
+          <span>Hedef Cümle / Okunan Metin</span>
+          <span class="input-hint">Boş bırakırsanız konuşmanız otomatik olarak yazıya çevrilecektir</span>
+        </div>
+        <input type="text" id="targetText" class="text-input" placeholder="Örn: Ben bugün eve erken gidiyorum.">
+      </div>
+
+      <!-- Audio Input Options -->
+      <div class="audio-controls">
+        <!-- Microphone Recording -->
+        <div class="control-box" id="recordBox">
+          <button id="recordBtn" class="record-btn" aria-label="Ses Kaydet">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+          </button>
+          <div class="box-title" id="recordStatus">Kaydı Başlatmak İçin Tıkla</div>
+          <div class="box-desc">Mikrofonunuzu kullanarak doğrudan konuşun</div>
+          <canvas id="waveformCanvas" width="300" height="60"></canvas>
+        </div>
+
+        <!-- File Upload -->
+        <div class="control-box" id="uploadDropZone">
+          <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <div class="box-title" id="uploadFileName">Ses Dosyası Yükle</div>
+          <div class="box-desc">Sürükleyip bırakın veya seçmek için tıklayın (.wav, .mp3)</div>
+          <input type="file" id="fileInput" accept="audio/*" style="display:none">
+        </div>
+      </div>
+
+      <!-- Audio Preview Player -->
+      <div id="audioPreview" class="audio-preview">
+        <audio id="audioPlayer" controls></audio>
+      </div>
+
+      <!-- Action Button -->
+      <button id="evalBtn" class="btn-primary" disabled>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+        Telaffuz ve Şive Analizini Başlat
+      </button>
+
+      <!-- Loading State -->
+      <div id="loadingBox" class="loading-box">
+        <div class="spinner"></div>
+        <div class="loading-text">Fonetik Analiz Yapılıyor...</div>
+        <div class="loading-step">Zorunlu hizalama (forced alignment), formant analizi ve standart referans dağılımları karşılaştırılıyor.</div>
+      </div>
+    </div>
+
+    <!-- Results Section -->
+    <div id="resultsSection" class="glass-panel">
+      <!-- Score Hero -->
+      <div class="score-hero">
+        <div class="score-hero-details">
+          <div id="statusBadge" class="status-badge badge-excellent">Standart Türkçe Telaffuz</div>
+          <h2>Standart Türkçe Yakınlık Skoru</h2>
+          <p id="heroDescription" class="hero-description">Konuşmanız standart İstanbul Türkçesi fonetik kurallarına ve doğal ses dağılımına çok yakın.</p>
+        </div>
+
+        <div class="score-circle-wrapper">
+          <svg class="score-circle-svg" viewBox="0 0 160 160">
+            <circle class="circle-bg" cx="80" cy="80" r="70" />
+            <circle id="circleProgress" class="circle-progress" cx="80" cy="80" r="70" />
+          </svg>
+          <div class="score-center-text">
+            <span id="overallScoreNumber" class="score-number">0</span>
+            <span class="score-total">/ 100</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Problematic Phonemes Alert -->
+      <div id="problematicBox" class="alert-problematic" style="display: none;">
+        <div class="alert-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          Dikkat Çeken Fonetik Sapmalar
+        </div>
+        <ul id="problematicList" class="alert-list">
+          <!-- Rendered dynamically -->
+        </ul>
+      </div>
+
+      <!-- Subscores Grid -->
+      <div class="subscores-grid">
+        <div class="subscore-card">
+          <div class="subscore-header">
+            <span class="subscore-title">Telaffuz</span>
+            <span id="subscorePronunciation" class="subscore-val">0</span>
+          </div>
+          <div class="progress-bar-bg"><div id="progressPronunciation" class="progress-bar-fill"></div></div>
+          <div class="subscore-desc">Fonetik artikülasyon ve ses benzerliği</div>
+        </div>
+
+        <div class="subscore-card">
+          <div class="subscore-header">
+            <span class="subscore-title">Ünlüler</span>
+            <span id="subscoreVowels" class="subscore-val">0</span>
+          </div>
+          <div class="progress-bar-bg"><div id="progressVowels" class="progress-bar-fill"></div></div>
+          <div class="subscore-desc">F1/F2 formant oranları ve ağız açıklığı</div>
+        </div>
+
+        <div class="subscore-card">
+          <div class="subscore-header">
+            <span class="subscore-title">Ünsüzler</span>
+            <span id="subscoreConsonants" class="subscore-val">0</span>
+          </div>
+          <div class="progress-bar-bg"><div id="progressConsonants" class="progress-bar-fill"></div></div>
+          <div class="subscore-desc">Sürtünme, patlama ve boğumlanma yeri</div>
+        </div>
+
+        <div class="subscore-card">
+          <div class="subscore-header">
+            <span class="subscore-title">Ritim</span>
+            <span id="subscoreRhythm" class="subscore-val">0</span>
+          </div>
+          <div class="progress-bar-bg"><div id="progressRhythm" class="progress-bar-fill"></div></div>
+          <div class="subscore-desc">Konuşma hızına göre normalize süre</div>
+        </div>
+
+        <div class="subscore-card">
+          <div class="subscore-header">
+            <span class="subscore-title">Tonlama</span>
+            <span id="subscoreIntonation" class="subscore-val">0</span>
+          </div>
+          <div class="progress-bar-bg"><div id="progressIntonation" class="progress-bar-fill"></div></div>
+          <div class="subscore-desc">Cümle ezgisi ve F0 perde eğrisi</div>
+        </div>
+      </div>
+
+      <!-- Word-level Breakdowns -->
+      <div style="margin-top: 30px;">
+        <span class="section-label">Kelime Bazlı Telaffuz Puanları (Detay için Kelimeye Tıklayın)</span>
+        <div id="wordChips" class="words-container">
+          <!-- Rendered dynamically -->
+        </div>
+      </div>
+
+      <!-- Phoneme Breakdown Table -->
+      <div style="margin-top: 36px;">
+        <span class="section-label">Ayrıntılı Fonem ve Akustik Analiz Tablosu</span>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>IPA</th>
+                <th>Harf / Kelime</th>
+                <th>Puan</th>
+                <th>Artikülasyon</th>
+                <th>Akustik</th>
+                <th>Süre</th>
+                <th>Akustik Teşhis</th>
+              </tr>
+            </thead>
+            <tbody id="phonemesTableBody">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
