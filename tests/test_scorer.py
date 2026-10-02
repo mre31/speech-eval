@@ -71,3 +71,29 @@ def test_scorer_outlier_filtering():
 
     assert detail_bad.is_valid is False
     assert "Düşük hizalama güveni" in detail_bad.diagnostic_note
+
+
+def test_scorer_unavailable_acoustic():
+    """Verify that when acoustic measurement fails, acoustic_score is None, acoustic_available is False,
+    and effective_score redistributes weight to embedding_score without penalizing the speaker."""
+    scorer = SpeechScorer()
+    
+    p = PhonemeItem(
+        grapheme="a", ipa="a", phoneme_key="/a/", word="at", word_index=0,
+        char_index_in_word=0, is_vowel=True
+    )
+
+    detail = scorer.score_single_phoneme(
+        phoneme=p,
+        duration=0.08,
+        confidence=0.95,
+        embedding_score=94.0,
+        acoustic_score=None,  # Formant measurement failed / Praat couldn't track
+        duration_score=92.0,
+        prosody_score=90.0
+    )
+
+    assert detail.acoustic_score is None
+    assert detail.acoustic_available is False
+    assert detail.effective_score == 94.0
+    assert detail.total_score >= 90.0

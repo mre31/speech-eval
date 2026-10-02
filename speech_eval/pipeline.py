@@ -96,7 +96,12 @@ class SpeechEvaluator:
         observed_diagnostics = []
         if self.config.enable_observed_phoneme_layer and user_logits is not None:
             observed_tokens = self.observed_analyzer.decode_logits(user_logits)
-            observed_diagnostics = self.observed_analyzer.align_sequences(phonemes, observed_tokens)
+            observed_diagnostics = self.observed_analyzer.align_sequences(
+                phonemes,
+                observed_tokens,
+                segments=user_segments,
+                logits=user_logits
+            )
 
         # 6. Extract user embeddings with speaker-mean subtraction
         user_embeddings = self.extractor.extract_all(

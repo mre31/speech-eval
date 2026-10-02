@@ -21,7 +21,9 @@ class PhonemeScoreDetail:
     alignment_confidence: float
     is_valid: bool
     embedding_score: float
-    acoustic_score: float
+    acoustic_score: Optional[float]
+    acoustic_available: bool
+    effective_score: float
     duration_score: float
     prosody_score: float
     total_score: float
@@ -83,15 +85,18 @@ class SpeechScorer:
             notes.append("Çok kısa ses segmenti")
 
         # If acoustic score is None (e.g. formants could not be measured by Praat),
-        # redistribute its weight to phonetic embedding score to avoid penalizing the user
+        # redistribute its weight to phonetic embedding score to avoid penalizing the user.
+        # UI data retains acoustic_score = None and acoustic_available = False for honest reporting.
         if acoustic_score is None:
             eff_acoustic = embedding_score
-            acoustic_display = round(embedding_score, 1)
+            acoustic_available = False
+            raw_acoustic = None
         else:
             eff_acoustic = acoustic_score
-            acoustic_display = round(acoustic_score, 1)
+            acoustic_available = True
+            raw_acoustic = round(acoustic_score, 1)
 
-        # Weighted score combination
+        # Weighted score combination uses eff_acoustic
         raw_total = (
             self.config.embedding_weight * embedding_score +
             self.config.acoustic_weight * eff_acoustic +
@@ -118,7 +123,9 @@ class SpeechScorer:
             alignment_confidence=round(confidence, 3),
             is_valid=is_valid,
             embedding_score=round(embedding_score, 1),
-            acoustic_score=acoustic_display,
+            acoustic_score=raw_acoustic,
+            acoustic_available=acoustic_available,
+            effective_score=round(eff_acoustic, 1),
             duration_score=round(duration_score, 1),
             prosody_score=round(prosody_score, 1),
             total_score=round(float(np.clip(total, 0.0, 100.0)), 1),
@@ -181,15 +188,35 @@ class SpeechScorer:
         emb_scores = [p.embedding_score for p in valid_items]
         pronunciation = robust_weighted_mean(emb_scores, all_weights)
 
+        # Subscore aggregation filters only available acoustic measurements
         vowel_items = [p for p in valid_items if p.grapheme in {'a', 'e', 'ı', 'i', 'o', 'ö', 'u', 'ü'}]
-        vowel_scores = [p.acoustic_score for p in vowel_items]
-        vowel_weights = [max(0.1, p.alignment_confidence) for p in vowel_items]
-        vowels = robust_weighted_mean(vowel_scores, vowel_weights) if vowel_scores else pronunciation
+        vowel_meas = [p for p in vowel_items if p.acoustic_available and p.acoustic_score is not None]
+        if vowel_meas:
+            vowel_scores = [p.acoustic_score for p in vowel_meas]
+            vowel_weights = [max(0.1, p.alignment_confidence) for p in vowel_meas]
+            vowels = robust_weighted_mean(vowel_scores, vowel_weights)
+        elif vowel_items:
+            vowels = robust_weighted_mean(
+                [p.embedding_score for p in vowel_items],
+                [max(0.1, p.alignment_confidence) for p in vowel_items]
+            )
+        else:
+            vowels = pronunciation
 
         cons_items = [p for p in valid_items if p.grapheme not in {'a', 'e', 'ı', 'i', 'o', 'ö', 'u', 'ü'}]
-        cons_scores = [p.acoustic_score for p in cons_items]
-        cons_weights = [max(0.1, p.alignment_confidence) for p in cons_items]
-        consonants = robust_weighted_mean(cons_scores, cons_weights) if cons_scores else pronunciation
+        cons_meas = [p for p in cons_items if p.acoustic_available and p.acoustic_score is not None]
+        if cons_meas:
+            cons_scores = [p.acoustic_score for p in cons_meas]
+            cons_weights = [max(0.1, p.alignment_confidence) for p in cons_meas]
+            consonants = robust_weighted_mean(cons_scores, cons_weights)
+        elif cons_items:
+            consonants = robust_weighted_mean(
+                [p.embedding_score for p in cons_items],
+                [max(0.1, p.alignment_confidence) for p in cons_items]
+            )
+        else:
+            consonants = pronunciation
+
 
         rhythm_scores = [p.duration_score for p in valid_items]
         rhythm = robust_weighted_mean(rhythm_scores, all_weights)

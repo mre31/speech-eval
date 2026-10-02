@@ -367,12 +367,16 @@ function renderPhonemesTable(words, filterWordIndex) {
 
       const isWarning = p.score < 75;
 
+      const acousticDisplay = (p.acoustic_available !== false && p.acoustic_score !== null && p.acoustic_score !== undefined)
+        ? p.acoustic_score
+        : '<span style="color:var(--text-dim); font-weight:600;" title="Formant ölçülemedi; artikülasyon puanı baz alındı">—</span>';
+
       row.innerHTML = `
         <td><span class="phoneme-pill">${p.key}</span></td>
         <td><strong>${p.grapheme}</strong> <span style="color:var(--text-dim); font-size:0.8rem">(${w.word})</span></td>
         <td><strong style="color: ${scoreColor}">${p.score}</strong></td>
         <td>${p.embedding_score}</td>
-        <td>${p.acoustic_score}</td>
+        <td>${acousticDisplay}</td>
         <td>${Math.round(p.duration * 1000)} ms</td>
         <td class="diagnostic-text ${isWarning ? 'diagnostic-warning' : ''}">${p.diagnostic}</td>
       `;

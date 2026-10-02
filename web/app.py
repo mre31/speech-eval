@@ -110,6 +110,8 @@ async def evaluate_audio(
                             "score": p.total_score,
                             "embedding_score": p.embedding_score,
                             "acoustic_score": p.acoustic_score,
+                            "acoustic_available": p.acoustic_available,
+                            "effective_score": p.effective_score,
                             "duration_score": p.duration_score,
                             "diagnostic": p.diagnostic_note,
                             "start": p.start_time,

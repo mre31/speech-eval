@@ -246,11 +246,27 @@ def compare_vowel_acoustics(
     z_f1 = abs(diff_f1) / (sigma_f1 + 0.08)
     z_f2 = abs(diff_f2) / (sigma_f2 + 0.08)
 
-    # Combined acoustic distance
-    # Error under 1.5 z-score is completely within standard variation (score 90-100)
+    # Combined acoustic distance (Nearey F1*, F2* z-distance)
     total_z = float(np.sqrt(0.5 * (z_f1 ** 2) + 0.5 * (z_f2 ** 2)))
     
-    score = max(30.0, min(100.0, 100.0 - max(0.0, total_z - 1.0) * 35.0))
+    # Smooth discriminatory scoring curve:
+    # - total_z in [0.0, 0.6]  -> 96 - 100 (çok yakın / ideal artikülasyon)
+    # - total_z in (0.6, 1.2]  -> 90 - 96  (doğal konuşmacı varyansı)
+    # - total_z in (1.2, 2.0]  -> 80 - 90  (hafif sapma / aksan)
+    # - total_z in (2.0, 3.0]  -> 60 - 80  (belirgin kayma)
+    # - total_z > 3.0          -> 30 - 60
+    if total_z <= 0.6:
+        raw_score = 99.5 - (total_z / 0.6) * 3.5
+    elif total_z <= 1.2:
+        raw_score = 96.0 - ((total_z - 0.6) / 0.6) * 6.0
+    elif total_z <= 2.0:
+        raw_score = 90.0 - ((total_z - 1.2) / 0.8) * 10.0
+    elif total_z <= 3.0:
+        raw_score = 80.0 - ((total_z - 2.0) / 1.0) * 20.0
+    else:
+        raw_score = max(30.0, 60.0 - (total_z - 3.0) * 15.0)
+
+    score = float(np.clip(raw_score, 30.0, 100.0))
 
     # Diagnostic feedback - only emit when deviation is truly significant (z > 2.2)
     diag_notes = []
