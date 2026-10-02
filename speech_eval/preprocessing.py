@@ -56,6 +56,26 @@ def trim_silence(audio: np.ndarray, sr: int = 16000, top_db: float = 30.0) -> Tu
     return audio[start:end], (start, end)
 
 
+import subprocess
+
+
+def load_audio_file(file_path: Union[str, Path], sr: int = 16000) -> np.ndarray:
+    """Loads any audio format (.wav, .webm, .mp3, .ogg, .m4a) reliably using librosa or ffmpeg."""
+    path_str = str(file_path)
+    try:
+        audio, _ = librosa.load(path_str, sr=sr, mono=True)
+        return audio.astype(np.float32)
+    except Exception:
+        cmd = [
+            "ffmpeg", "-v", "error", "-nostdin", "-threads", "0", "-i", path_str,
+            "-f", "f32le", "-ac", "1", "-ar", str(sr), "-"
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Ses dosyası çözümlenemedi: {proc.stderr.decode('utf-8', errors='ignore')}")
+        return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
 def preprocess_audio(
     audio_input: Union[str, Path, np.ndarray],
     sr: int = 16000,
@@ -74,7 +94,7 @@ def preprocess_audio(
         mono float32 numpy array sampled at 16000 Hz
     """
     if isinstance(audio_input, (str, Path)):
-        audio, orig_sr = librosa.load(str(audio_input), sr=sr, mono=True)
+        audio = load_audio_file(audio_input, sr=sr)
     else:
         audio = np.asarray(audio_input, dtype=np.float32)
         if audio.ndim > 1:
