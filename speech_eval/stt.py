@@ -41,7 +41,7 @@ def normalize_turkish_text(text: str) -> str:
 class TurkishSTT:
     """Wrapper around faster-whisper for Turkish speech recognition."""
 
-    def __init__(self, model_size: str = "base", device: str = "cuda"):
+    def __init__(self, model_size: str = "large-v3", device: str = "cuda"):
         self.device = device
         compute_type = "float16" if device == "cuda" else "int8"
         try:

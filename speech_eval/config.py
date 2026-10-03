@@ -16,7 +16,7 @@ class EvalConfig:
 
     # Model identifiers
     wav2vec2_model_id: str = "mpoyraz/wav2vec2-xls-r-300m-cv7-turkish"
-    whisper_model_size: str = "base"
+    whisper_model_size: str = "large-v3"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Embedding configuration

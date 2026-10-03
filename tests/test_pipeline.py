@@ -1,12 +1,15 @@
 """End-to-end pipeline test."""
 
 import numpy as np
+from speech_eval.config import EvalConfig
 from speech_eval.pipeline import SpeechEvaluator
 from speech_eval.scorer import EvaluationResult
 
 
 def test_evaluator_sample():
-    evaluator = SpeechEvaluator()
+    # Use CPU in pipeline unit test to allow tests to run concurrently with the active GPU server
+    config = EvalConfig(whisper_model_size="base", device="cpu")
+    evaluator = SpeechEvaluator(config=config)
     res = evaluator.evaluate("/tmp/test_tts.mp3", target_text="merhaba bugün nasılsınız")
 
     assert isinstance(res, EvaluationResult)
