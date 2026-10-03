@@ -170,6 +170,17 @@ def test_observed_allophonic_and_close_classes():
     assert diags_al[0].status == "substitution"
     assert diags_al[0].score_multiplier == 0.75
 
+    # 5. Orthographic 'c' for expected 'k' is a real substitution (/dʒ/ vs /k/), NOT an allophone!
+    phonemes_kar = g2p.convert("kar")
+    tokens_car = [
+        ObservedToken("c", 0, 0.95),  # spoken as "car"
+        ObservedToken("a", 1, 0.95),
+        ObservedToken("r", 2, 0.95),
+    ]
+    diags_car = analyzer.align_sequences(phonemes_kar, tokens_car)
+    assert diags_car[0].status == "substitution"
+    assert diags_car[0].score_multiplier == 0.75
+
 
 def test_observed_unconstrained_deletion_no_circularity():
     """Verify that deletion detection does NOT falsely rely on circular forced alignment seg_conf.
@@ -190,17 +201,16 @@ def test_observed_unconstrained_deletion_no_circularity():
     g2p = TurkishG2P()
     # Expected: "gideceğim" -> phonemes include 'i' (char 7)
     phonemes = g2p.convert("gideceğim")
-    exp_i_idx = 7  # the 'i' in "-eceğim"
 
-    # Spoken audio only contains "gidecem"
+    # Spoken audio only contains "gidecem" with unconstrained frame spans
     tokens = [
-        ObservedToken("g", 0, 0.95),
-        ObservedToken("i", 1, 0.95),
-        ObservedToken("d", 2, 0.95),
-        ObservedToken("e", 3, 0.95),
-        ObservedToken("c", 4, 0.95),
-        ObservedToken("e", 5, 0.95),
-        ObservedToken("m", 6, 0.95),
+        ObservedToken("g", 0, 0.95, end_frame_idx=1),
+        ObservedToken("i", 1, 0.95, end_frame_idx=2),
+        ObservedToken("d", 2, 0.95, end_frame_idx=3),
+        ObservedToken("e", 3, 0.95, end_frame_idx=4),
+        ObservedToken("c", 4, 0.95, end_frame_idx=5),
+        ObservedToken("e", 5, 0.95, end_frame_idx=8),
+        ObservedToken("m", 8, 0.95, end_frame_idx=10),
     ]
 
     # Create dummy logits [1, T=10, vocab=20] where token 'i' (id=2) has ZERO presence,
@@ -226,4 +236,5 @@ def test_observed_unconstrained_deletion_no_circularity():
     deleted_i = [d for d in diags if d.expected_char == 'i' and d.status == "deletion"]
     assert len(deleted_i) >= 1
     assert deleted_i[0].score_multiplier == 0.75
+
 
